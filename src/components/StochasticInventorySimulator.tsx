@@ -21,7 +21,7 @@ import {
   Warehouse,
   Clock
 } from "lucide-react";
-import { ModelType, EOQParams, ShortageParams, EPQParams, NewsboyParams, CalculationResults } from "../types";
+import { ModelType, EOQParams, ShortageParams, EPQParams, NewsboyParams, ThresholdParams, CalculationResults } from "../types";
 import MonteCarloRaindropChart from "./MonteCarloRaindropChart";
 
 // Box-Muller transform for normally distributed stochastic demands
@@ -44,6 +44,7 @@ interface SimulatorProps {
   shortageParams: ShortageParams;
   epqParams: EPQParams;
   newsboyParams: NewsboyParams;
+  thresholdParams: ThresholdParams;
   results: CalculationResults;
 }
 
@@ -62,6 +63,7 @@ export default function StochasticInventorySimulator({
   shortageParams,
   epqParams,
   newsboyParams,
+  thresholdParams,
   results
 }: SimulatorProps) {
   // Common states
@@ -95,7 +97,7 @@ export default function StochasticInventorySimulator({
     setLeadTimeProgress(0);
     setEpqProdProgress(0);
     setHasOrdered(false);
-  }, [activeModel, eoqParams, shortageParams, epqParams, results.Q_opt, results.S_opt]);
+  }, [activeModel, eoqParams, shortageParams, epqParams, thresholdParams, results.Q_opt, results.S_opt]);
 
   // Main animation / simulation loop for Continuous Models
   useEffect(() => {
@@ -132,9 +134,20 @@ export default function StochasticInventorySimulator({
         D = epqParams.D;
         L = epqParams.L;
         P = epqParams.P;
+      } else if (activeModel === ModelType.THRESHOLD) {
+        D = thresholdParams.D;
+        L = thresholdParams.L;
+        ROP = results.ROP || 0;
       }
 
-      const demandPerDay = D / 365;
+      let demandPerDay = D / 365;
+      if (activeModel === ModelType.THRESHOLD) {
+        const stepMean = (thresholdParams.D / 365) * deltaDays;
+        const stepStd = thresholdParams.sigmaDaily * Math.sqrt(deltaDays);
+        demandPerDay = randomNormal(stepMean, stepStd) / deltaDays;
+        if (demandPerDay < 0) demandPerDay = 0;
+      }
+
       const productionPerDay = P / 365;
 
       setSimTime(prev => prev + deltaDays);
@@ -163,7 +176,7 @@ export default function StochasticInventorySimulator({
             return nextProg;
           });
         } else {
-          // Standard constant consumption
+          // Standard consumption
           nextInv = prevInv - demandPerDay * deltaDays;
         }
 
@@ -186,7 +199,7 @@ export default function StochasticInventorySimulator({
                 setTruckState("producing");
                 setEpqProdProgress(0);
               } else {
-                // Instantaneous delivery receipt (EOQ or SHORTAGE)
+                // Instantaneous delivery receipt (EOQ, SHORTAGE or THRESHOLD)
                 setTruckState("idle");
                 setHasOrdered(false);
                 setLastReplenishQty(Q);
@@ -214,7 +227,7 @@ export default function StochasticInventorySimulator({
 
     frameId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frameId);
-  }, [isPlaying, simSpeed, activeModel, eoqParams, shortageParams, epqParams, results, truckState, hasOrdered]);
+  }, [isPlaying, simSpeed, activeModel, eoqParams, shortageParams, epqParams, thresholdParams, results, truckState, hasOrdered]);
 
   // Handle instantaneous inventory receipt when transit is finished
   useEffect(() => {

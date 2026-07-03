@@ -1,4 +1,4 @@
-import { ModelType, EOQParams, ShortageParams, EPQParams, NewsboyParams, CalculationResults } from "../types";
+import { ModelType, EOQParams, ShortageParams, EPQParams, NewsboyParams, ThresholdParams, CalculationResults } from "../types";
 
 /**
  * Standard Normal Probability Density Function (PDF)
@@ -264,6 +264,65 @@ export function solveNewsboy(params: NewsboyParams): CalculationResults {
 }
 
 /**
+ * Solve Stochastic Continuous (s, Q) Threshold Control Model
+ */
+export function solveThreshold(params: ThresholdParams): CalculationResults {
+  const { D, C1, C3, L, sigmaDaily, serviceLevel } = params;
+
+  if (D <= 0 || C1 <= 0 || C3 <= 0 || serviceLevel <= 0 || serviceLevel >= 1) {
+    return { Q_opt: 0, totalCost: 0 };
+  }
+
+  // 1. 最优订货批量 Q_opt (基于EOQ近似)
+  const Q_opt = Math.sqrt((2 * D * C3) / C1);
+
+  // 2. 提前期需求均值与标准差
+  const dailyDemand = D / 365;
+  const leadTimeDemandMean = dailyDemand * L;
+  const leadTimeDemandStdDev = sigmaDaily * Math.sqrt(L);
+
+  // 3. 安全系数 z
+  const zScore = inverseNormalCDF(serviceLevel);
+
+  // 4. 安全库存 Safety Stock
+  const safetyStock = zScore * leadTimeDemandStdDev;
+
+  // 5. 重新订货点 ROP
+  const ROP = leadTimeDemandMean + safetyStock;
+
+  // 6. 成本计算
+  const setupCost = (D / Q_opt) * C3;
+  const holdingCostCycle = (Q_opt / 2) * C1;
+  const holdingCostSafety = safetyStock * C1;
+  const holdingCost = holdingCostCycle + holdingCostSafety;
+  const totalCost = setupCost + holdingCost;
+
+  const N_opt = D / Q_opt;
+  const t_opt = Q_opt / D;
+
+  return {
+    Q_opt,
+    totalCost,
+    holdingCost,
+    setupCost,
+    I_max: Q_opt + safetyStock,
+    N_opt,
+    t_opt,
+    ROP,
+    // 映射到公共属性便于组件统一显示
+    criticalRatio: serviceLevel,
+    expectedSales: safetyStock,          // 借用存放安全库存
+    expectedLeftover: leadTimeDemandMean, // 借用存放提前期均值
+    expectedShortage: leadTimeDemandStdDev, // 借用存放提前期标准差
+    // 专属属性
+    safetyStock,
+    leadTimeDemandMean,
+    leadTimeDemandStdDev,
+    zScore
+  };
+}
+
+/**
  * Universal dispatcher
  */
 export function solveInventoryModel(modelType: ModelType, params: any): CalculationResults {
@@ -276,6 +335,8 @@ export function solveInventoryModel(modelType: ModelType, params: any): Calculat
       return solveEPQ(params as EPQParams);
     case ModelType.NEWSBOY:
       return solveNewsboy(params as NewsboyParams);
+    case ModelType.THRESHOLD:
+      return solveThreshold(params as ThresholdParams);
     default:
       return { Q_opt: 0, totalCost: 0 };
   }
@@ -297,6 +358,28 @@ export function calculateSensitivity(
   const baseValue = baseParams[varyingParam];
   
   if (baseValue === undefined || baseValue <= 0) return [];
+
+  // If we are varying serviceLevel, handle it separately to avoid exceeding 1.0 boundary
+  if (varyingParam === "serviceLevel") {
+    const slMin = 0.80;
+    const slMax = 0.999;
+    for (let i = 0; i <= steps; i++) {
+      const val = slMin + (i / steps) * (slMax - slMin);
+      const testParams = { ...baseParams, serviceLevel: val };
+      const testResults = solveInventoryModel(modelType, testParams);
+      
+      points.push({
+        value: Number(val.toFixed(4)),
+        percentChange: Number(((val - baseValue) / baseValue * 100).toFixed(1)),
+        totalCost: Number(testResults.totalCost.toFixed(2)),
+        Q_opt: Number(testResults.Q_opt.toFixed(2)),
+        holdingCost: Number((testResults.holdingCost || 0).toFixed(2)),
+        safetyStock: Number((testResults.safetyStock || 0).toFixed(2)),
+        shortageRisk: Number(((1 - val) * 100).toFixed(2))
+      });
+    }
+    return points;
+  }
 
   // Calculate base results to compute percent change
   const baseResults = solveInventoryModel(modelType, baseParams);

@@ -274,6 +274,63 @@ else:
 
 print("=========================================")
 `;
+    } else if (modelType === "THRESHOLD") {
+      pyScript = `import math
+
+# 1. 连续型随机库存控制 (s, Q) 阀值控制模型
+D = ${params.D}               # 年需求量
+C1 = ${params.C1}             # 单位年持有费
+C3 = ${params.C3}             # 单次起订/整备成本
+L = ${params.L}               # 前置时间 (天)
+sigma_daily = ${params.sigmaDaily} # 日需求标准差
+service_level = ${params.serviceLevel} # 期望服务水平 (0.80 ~ 0.999)
+
+# 2. 运算公式
+Q_opt = math.sqrt((2 * D * C3) / C1)
+daily_demand = D / 365.0
+lead_mean = daily_demand * L
+lead_std = sigma_daily * math.sqrt(L)
+
+# 采用高精度 Probit 的正态分布安全系数算法
+def erfinv(y):
+    a = 0.147
+    if y == 0: return 0
+    log_term = math.log(1 - y*y)
+    tmp1 = 2 / (math.pi * a) + log_term / 2
+    tmp2 = log_term / a
+    val = math.sqrt(math.sqrt(tmp1*tmp1 - tmp2) - tmp1)
+    return val if y > 0 else -val
+
+def ppf(p):
+    return math.sqrt(2) * erfinv(2 * p - 1)
+
+z = ppf(service_level)
+ss = z * lead_std
+rop = lead_mean + ss
+
+setup_cost = (D / Q_opt) * C3
+holding_cost = (Q_opt / 2.0 + ss) * C1
+total_cost = setup_cost + holding_cost
+
+# 3. 输出求解结果
+print("=========================================")
+print("=== PYTHON 运筹学：连续型 (s, Q) 阀值控制 ===")
+print("=========================================")
+print(f"|  年需求总量 (D):         {D:12.0f} 件")
+print(f"|  期望服务水平 (SL):      {service_level*100:11.1f}%")
+print(f"|  安全系数 Z-score:       {z:12.4f}")
+print("-----------------------------------------")
+print(f"|  最优订货批量 (Q*):      {Q_opt:12.2f} 件")
+print(f"|  提前期均值需求 (μ_L):   {lead_mean:12.2f} 件")
+print(f"|  提前期标准差 (σ_L):     {lead_std:12.2f} 件")
+print(f"|  安全库存 (Safety Stock): {ss:12.2f} 件")
+print(f"|  重新订货触发阈值 (s*):  {rop:12.2f} 件")
+print("-----------------------------------------")
+print(f"|  年起订整备费 (Setup):   ¥{setup_cost:11.2f}")
+print(f"|  年均持有成本 (Holding): ¥{holding_cost:11.2f}")
+print(f"|  年化期望总成本 (Total): ¥{total_cost:11.2f}")
+print("=========================================")
+`;
     }
 
     // Write to temporary file, execute, and then delete
@@ -366,7 +423,7 @@ function simulatePythonConsole(modelType: string, params: any): string {
 |  最优年化总期望成本 (Total):¥${(setup+hold).toFixed(2).padStart(11)}
 |  重新开工触发点 (ROP):   ${((params.D / 365) * params.L).toFixed(2).padStart(12)} 件
 =========================================`;
-  } else {
+  } else if (modelType === "NEWSBOY") {
     const cr = params.Cu / (params.Cu + params.Co);
     const a = params.minDemand;
     const b = params.maxDemand;
@@ -438,6 +495,47 @@ function simulatePythonConsole(modelType: string, params: any): string {
 |  期望最小综合损失 (Loss): ¥${total.toFixed(2).padStart(11)}
 =========================================`;
     }
+  } else if (modelType === "THRESHOLD") {
+    const Q = Math.sqrt((2 * params.D * params.C3) / params.C1);
+    const dailyDemand = params.D / 365;
+    const leadMean = dailyDemand * params.L;
+    const leadStd = params.sigmaDaily * Math.sqrt(params.L);
+    const erfinv = (y: number): number => {
+      const a_val = 0.147;
+      if (y === 0) return 0;
+      const log_term = Math.log(1 - y * y);
+      const tmp1 = 2 / (Math.PI * a_val) + log_term / 2;
+      const tmp2 = log_term / a_val;
+      const val = Math.sqrt(Math.sqrt(tmp1 * tmp1 - tmp2) - tmp1);
+      return y > 0 ? val : -val;
+    };
+    const ppf = (p: number): number => {
+      return Math.sqrt(2) * erfinv(2 * p - 1);
+    };
+    const z = ppf(params.serviceLevel);
+    const ss = z * leadStd;
+    const ROP = leadMean + ss;
+    const setup = (params.D / Q) * params.C3;
+    const hold = (Q / 2 + ss) * params.C1;
+    return `=========================================
+=== PYTHON 运筹学：连续型 (s, Q) 阀值控制 ===
+=========================================
+|  年需求总量 (D):         ${params.D.toFixed(0).padStart(12)} 件
+|  期望服务水平 (SL):      ${(params.serviceLevel * 100).toFixed(1).padStart(11)}%
+|  安全系数 Z-score:       ${z.toFixed(4).padStart(12)}
+-----------------------------------------
+|  最优订货批量 (Q*):      ${Q.toFixed(2).padStart(12)} 件
+|  提前期均值需求 (μ_L):   ${leadMean.toFixed(2).padStart(12)} 件
+|  提前期标准差 (σ_L):     ${leadStd.toFixed(2).padStart(12)} 件
+|  安全库存 (Safety Stock): ${ss.toFixed(2).padStart(12)} 件
+|  重新订货触发阈值 (s*):  ${ROP.toFixed(2).padStart(12)} 件
+-----------------------------------------
+|  年起订整备费 (Setup):   ¥${setup.toFixed(2).padStart(11)}
+|  年均持有成本 (Holding): ¥${hold.toFixed(2).padStart(11)}
+|  年化期望总成本 (Total): ¥${(setup + hold).toFixed(2).padStart(11)}
+=========================================`;
+  } else {
+    return "未知模型";
   }
 }
 

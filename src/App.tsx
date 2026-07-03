@@ -31,8 +31,8 @@ import {
   Sparkles,
   Share2
 } from "lucide-react";
-import { ModelType, EOQParams, ShortageParams, EPQParams, NewsboyParams, CalculationResults, AIInsightResponse, SavedScenario } from "./types";
-import { solveInventoryModel, calculateSensitivity, normalPDF, normalCDF } from "./utils/solver";
+import { ModelType, EOQParams, ShortageParams, EPQParams, NewsboyParams, ThresholdParams, CalculationResults, AIInsightResponse, SavedScenario } from "./types";
+import { solveInventoryModel, calculateSensitivity, normalPDF, normalCDF, inverseNormalCDF } from "./utils/solver";
 import StochasticInventorySimulator from "./components/StochasticInventorySimulator";
 
 // Animated Sawtooth Path Component using SVG SMIL animation for smooth transitions
@@ -114,6 +114,15 @@ export default function App() {
     Co: 15,     // 滞销损失 (进价 - 残值)
   });
 
+  const [thresholdParams, setThresholdParams] = useState<ThresholdParams>({
+    D: 8000,
+    C1: 5.0,
+    C3: 150,
+    L: 10,
+    sigmaDaily: 15,      // 日需求标准差 (件/天)
+    serviceLevel: 0.95,  // 期望服务水平 (95%)
+  });
+
   // Current solver results
   const [results, setResults] = useState<CalculationResults>({ Q_opt: 0, totalCost: 0 });
   
@@ -169,6 +178,7 @@ export default function App() {
   });
   const [showLlmSettingsModal, setShowLlmSettingsModal] = useState<boolean>(false);
   const [showKnowledgeModal, setShowKnowledgeModal] = useState<boolean>(false);
+  const [showThresholdInfoModal, setShowThresholdInfoModal] = useState<boolean>(false);
   const [activeAiTab, setActiveAiTab] = useState<'diagnostic' | 'chat'>("diagnostic");
 
   // Safety Stock Optimization State
@@ -406,7 +416,7 @@ print("=========================================")`;
 |  最优年化总期望成本 (Total):¥${(setup + hold).toFixed(2).padStart(11)}
 |  重新开工触发点 (ROP):   ${((params.D / 365) * params.L).toFixed(2).padStart(12)} 件
 =========================================`;
-    } else {
+    } else if (modelType === ModelType.NEWSBOY) {
       const cr = params.Cu / (params.Cu + params.Co);
       const a = params.minDemand;
       const b = params.maxDemand;
@@ -478,6 +488,47 @@ print("=========================================")`;
 |  期望最小综合损失 (Loss): ¥${total.toFixed(2).padStart(11)}
 =========================================`;
       }
+    } else if (modelType === ModelType.THRESHOLD) {
+      const Q = Math.sqrt((2 * params.D * params.C3) / params.C1);
+      const dailyDemand = params.D / 365;
+      const leadMean = dailyDemand * params.L;
+      const leadStd = params.sigmaDaily * Math.sqrt(params.L);
+      const erfinv = (y: number): number => {
+        const a_val = 0.147;
+        if (y === 0) return 0;
+        const log_term = Math.log(1 - y * y);
+        const tmp1 = 2 / (Math.PI * a_val) + log_term / 2;
+        const tmp2 = log_term / a_val;
+        const val = Math.sqrt(Math.sqrt(tmp1 * tmp1 - tmp2) - tmp1);
+        return y > 0 ? val : -val;
+      };
+      const ppf = (p: number): number => {
+        return Math.sqrt(2) * erfinv(2 * p - 1);
+      };
+      const z = ppf(params.serviceLevel);
+      const ss = z * leadStd;
+      const ROP = leadMean + ss;
+      const setup = (params.D / Q) * params.C3;
+      const hold = (Q / 2 + ss) * params.C1;
+      return `=========================================
+=== PYTHON 运筹学：连续型 (s, Q) 阀值控制 ===
+=========================================
+|  年需求总量 (D):         ${params.D.toFixed(0).padStart(12)} 件
+|  期望服务水平 (SL):      ${(params.serviceLevel * 100).toFixed(1).padStart(11)}%
+|  安全系数 Z-score:       ${z.toFixed(4).padStart(12)}
+-----------------------------------------
+|  最优订货批量 (Q*):      ${Q.toFixed(2).padStart(12)} 件
+|  提前期均值需求 (μ_L):   ${leadMean.toFixed(2).padStart(12)} 件
+|  提前期标准差 (σ_L):     ${leadStd.toFixed(2).padStart(12)} 件
+|  安全库存 (Safety Stock): ${ss.toFixed(2).padStart(12)} 件
+|  重新订货触发阈值 (s*):  ${ROP.toFixed(2).padStart(12)} 件
+-----------------------------------------
+|  年起订整备费 (Setup):   ¥${setup.toFixed(2).padStart(11)}
+|  年均持有成本 (Holding): ¥${hold.toFixed(2).padStart(11)}
+|  年化期望总成本 (Total): ¥${(setup + hold).toFixed(2).padStart(11)}
+=========================================`;
+    } else {
+      return "未知模型";
     }
   };
 
@@ -485,7 +536,9 @@ print("=========================================")`;
     if (activeModel === ModelType.EOQ) return eoqParams;
     if (activeModel === ModelType.SHORTAGE) return shortageParams;
     if (activeModel === ModelType.EPQ) return epqParams;
-    return newsboyParams;
+    if (activeModel === ModelType.NEWSBOY) return newsboyParams;
+    if (activeModel === ModelType.THRESHOLD) return thresholdParams;
+    return eoqParams;
   };
 
   const executePythonVerification = async () => {
@@ -579,6 +632,11 @@ print("=========================================")`;
       if (sensitiveParam === "C4" || sensitiveParam === "Cu") {
         setSensitiveParam("P");
       }
+    } else if (activeModel === ModelType.THRESHOLD) {
+      currentParams = thresholdParams;
+      if (sensitiveParam === "C4" || sensitiveParam === "P" || sensitiveParam === "Cu") {
+        setSensitiveParam("C3");
+      }
     } else {
       currentParams = newsboyParams;
       if (sensitiveParam === "C3" || sensitiveParam === "C1" || sensitiveParam === "L") {
@@ -594,7 +652,7 @@ print("=========================================")`;
     const sensPoints = calculateSensitivity(activeModel, currentParams, activeSensParam, 0.4, 1.6, 8);
     setSensitivityData(sensPoints);
     setSawtoothTooltip(null);
-  }, [activeModel, eoqParams, shortageParams, epqParams, newsboyParams, sensitiveParam]);
+  }, [activeModel, eoqParams, shortageParams, epqParams, newsboyParams, thresholdParams, sensitiveParam]);
 
   // Smoothly animate sawtoothCycles when playing is active
   useEffect(() => {
@@ -654,6 +712,7 @@ print("=========================================")`;
     if (model === ModelType.EOQ) return ["C3", "C1", "D"].includes(sensitiveParam) ? sensitiveParam : "C3";
     if (model === ModelType.SHORTAGE) return ["C3", "C1", "D", "C4"].includes(sensitiveParam) ? sensitiveParam : "C3";
     if (model === ModelType.EPQ) return ["C3", "C1", "D", "P"].includes(sensitiveParam) ? sensitiveParam : "C3";
+    if (model === ModelType.THRESHOLD) return ["C3", "C1", "D", "serviceLevel"].includes(sensitiveParam) ? sensitiveParam : "C3";
     return ["Cu", "Co", "mean"].includes(sensitiveParam) ? sensitiveParam : "Cu";
   };
 
@@ -665,6 +724,8 @@ print("=========================================")`;
       setShortageParams({ D: 8000, C1: 5.0, C3: 150, L: 10, C4: 15.0 });
     } else if (activeModel === ModelType.EPQ) {
       setEpqParams({ D: 8000, C1: 5.0, C3: 150, L: 10, P: 24000 });
+    } else if (activeModel === ModelType.THRESHOLD) {
+      setThresholdParams({ D: 8000, C1: 5.0, C3: 150, L: 10, sigmaDaily: 15, serviceLevel: 0.95 });
     } else {
       setNewsboyParams({ mean: 500, stdDev: 120, minDemand: 100, maxDemand: 900, distribution: "normal", Cu: 45, Co: 15 });
     }
@@ -679,6 +740,7 @@ print("=========================================")`;
     if (activeModel === ModelType.EOQ) currentParams = eoqParams;
     else if (activeModel === ModelType.SHORTAGE) currentParams = shortageParams;
     else if (activeModel === ModelType.EPQ) currentParams = epqParams;
+    else if (activeModel === ModelType.THRESHOLD) currentParams = thresholdParams;
     else currentParams = newsboyParams;
 
     const newScenario: SavedScenario = {
@@ -708,6 +770,7 @@ print("=========================================")`;
     if (scenario.modelType === ModelType.EOQ) setEoqParams(scenario.params);
     else if (scenario.modelType === ModelType.SHORTAGE) setShortageParams(scenario.params);
     else if (scenario.modelType === ModelType.EPQ) setEpqParams(scenario.params);
+    else if (scenario.modelType === ModelType.THRESHOLD) setThresholdParams(scenario.params);
     else setNewsboyParams(scenario.params);
     setAiInsight(null);
   };
@@ -1007,6 +1070,7 @@ ${JSON.stringify(results, null, 2)}
       case ModelType.SHORTAGE: return "允许缺货延迟交货模型";
       case ModelType.EPQ: return "经济生产批量模型 (EPQ)";
       case ModelType.NEWSBOY: return "报童模型 (随机单周期)";
+      case ModelType.THRESHOLD: return "连续型随机 (s, Q) 阀值控制模型";
     }
   };
 
@@ -1055,6 +1119,7 @@ ${JSON.stringify(results, null, 2)}
                 {model === ModelType.SHORTAGE && "允许缺货模型"}
                 {model === ModelType.EPQ && "生产连续 EPQ"}
                 {model === ModelType.NEWSBOY && "随机报童模型"}
+                {model === ModelType.THRESHOLD && "阀值控制 (s, Q)"}
               </button>
             ))}
           </div>
@@ -1537,6 +1602,127 @@ ${JSON.stringify(results, null, 2)}
                 </div>
               </div>
             )}
+
+            {/* THRESHOLD PARAMETERS */}
+            {activeModel === ModelType.THRESHOLD && (
+              <div className="space-y-5">
+                <div>
+                  <div className="flex justify-between text-xs font-medium text-slate-700 mb-2">
+                    <span className="flex items-center gap-1.5">
+                      年需求量 <code className="text-[10px] bg-slate-100 px-1.5 py-0.5 rounded font-mono text-slate-600">D</code>
+                    </span>
+                    <span className="font-mono text-indigo-600 font-semibold">{thresholdParams.D} 件/年</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="500"
+                    max="30000"
+                    step="100"
+                    value={thresholdParams.D}
+                    onChange={(e) => setThresholdParams({ ...thresholdParams, D: parseInt(e.target.value) })}
+                    className="w-full accent-indigo-600 animate-slider"
+                  />
+                  <p className="text-[11px] text-slate-400 mt-1">此库存控制策略下一年中的总预期需求量。</p>
+                </div>
+
+                <div>
+                  <div className="flex justify-between text-xs font-medium text-slate-700 mb-2">
+                    <span className="flex items-center gap-1.5">
+                      单位年存储费 <code className="text-[10px] bg-slate-100 px-1.5 py-0.5 rounded font-mono text-slate-600">C1</code>
+                    </span>
+                    <span className="font-mono text-indigo-600 font-semibold">¥{thresholdParams.C1} /件/年</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="50.0"
+                    step="0.5"
+                    value={thresholdParams.C1}
+                    onChange={(e) => setThresholdParams({ ...thresholdParams, C1: parseFloat(e.target.value) })}
+                    className="w-full accent-indigo-600 animate-slider"
+                  />
+                  <p className="text-[11px] text-slate-400 mt-1">保管、折旧和机会成本导致的单位年均储存费用。</p>
+                </div>
+
+                <div>
+                  <div className="flex justify-between text-xs font-medium text-slate-700 mb-2">
+                    <span className="flex items-center gap-1.5">
+                      单次起订费 <code className="text-[10px] bg-slate-100 px-1.5 py-0.5 rounded font-mono text-slate-600">C3</code>
+                    </span>
+                    <span className="font-mono text-indigo-600 font-semibold">¥{thresholdParams.C3} /次</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="10"
+                    max="1000"
+                    step="10"
+                    value={thresholdParams.C3}
+                    onChange={(e) => setThresholdParams({ ...thresholdParams, C3: parseInt(e.target.value) })}
+                    className="w-full accent-indigo-600 animate-slider"
+                  />
+                  <p className="text-[11px] text-slate-400 mt-1">每下一次订单所需的手续费、整备费及行政开销。</p>
+                </div>
+
+                <div className="border-t border-slate-100 pt-4 space-y-5">
+                  <div>
+                    <div className="flex justify-between text-xs font-medium text-slate-700 mb-2">
+                      <span className="flex items-center gap-1.5">
+                        交货前置时间 <code className="text-[10px] bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded font-mono">L</code>
+                      </span>
+                      <span className="font-mono text-indigo-600 font-semibold">{thresholdParams.L} 天</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="1"
+                      max="60"
+                      step="1"
+                      value={thresholdParams.L}
+                      onChange={(e) => setThresholdParams({ ...thresholdParams, L: parseInt(e.target.value) })}
+                      className="w-full accent-indigo-600 animate-slider"
+                    />
+                    <p className="text-[11px] text-slate-400 mt-1">从发出订货单到货物到达并入库所需的交货提前期。</p>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs font-medium text-slate-700 mb-2">
+                      <span className="flex items-center gap-1.5">
+                        日需求标准差 <code className="text-[10px] bg-sky-50 text-sky-700 px-1.5 py-0.5 rounded font-mono">σ_d</code>
+                      </span>
+                      <span className="font-mono text-indigo-600 font-semibold">{thresholdParams.sigmaDaily} 件/天</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="1"
+                      max="100"
+                      step="1"
+                      value={thresholdParams.sigmaDaily}
+                      onChange={(e) => setThresholdParams({ ...thresholdParams, sigmaDaily: parseInt(e.target.value) })}
+                      className="w-full accent-indigo-600 animate-slider"
+                    />
+                    <p className="text-[11px] text-slate-400 mt-1">衡量日常需求波动的随机程度。用以核算提前期累积波动量。</p>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs font-medium text-slate-700 mb-2">
+                      <span className="flex items-center gap-1.5">
+                        期望服务水平 <code className="text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded font-mono">SL</code>
+                      </span>
+                      <span className="font-mono text-emerald-600 font-semibold">{(thresholdParams.serviceLevel * 100).toFixed(1)} %</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.800"
+                      max="0.999"
+                      step="0.005"
+                      value={thresholdParams.serviceLevel}
+                      onChange={(e) => setThresholdParams({ ...thresholdParams, serviceLevel: parseFloat(e.target.value) })}
+                      className="w-full accent-indigo-600 animate-slider"
+                    />
+                    <p className="text-[11px] text-slate-400 mt-1">提前期内不发生缺货的概率保证。服务水平越高，安全库存需求越大。</p>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* SCENARIOS MANAGER & SAVING */}
@@ -1609,8 +1795,17 @@ ${JSON.stringify(results, null, 2)}
               <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider bg-indigo-900/50 px-2 py-0.5 rounded-md border border-indigo-500/20">
                 最优库存控制策略
               </span>
-              <h2 className="text-xl md:text-2xl font-black mt-1.5 tracking-tight">
-                {getModelLabel(activeModel)}
+              <h2 className="text-xl md:text-2xl font-black mt-1.5 tracking-tight flex items-center gap-2">
+                <span>{getModelLabel(activeModel)}</span>
+                {activeModel === ModelType.THRESHOLD && (
+                  <button
+                    onClick={() => setShowThresholdInfoModal(true)}
+                    className="p-1 text-indigo-300 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+                    title="了解 (s, Q) 阀值控制模型（连续 vs 定期评述）"
+                  >
+                    <Info className="w-5 h-5 animate-pulse" />
+                  </button>
+                )}
               </h2>
               <p className="text-xs text-slate-300 mt-1 max-w-xl">
                 根据运筹学一阶条件求导（First-Order Optimality Condition）推算的最优期望批量。此参数组合下库存运行总成本处于绝对极小值点。
@@ -1642,8 +1837,8 @@ ${JSON.stringify(results, null, 2)}
 
           {/* DYNAMIC VISUALIZATION CANVAS */}
           <div id="dynamic-visualization-canvas" className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
-            <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
-              <div>
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4 pb-3 border-b border-slate-100">
+              <div className="flex-1 min-w-[200px]">
                 <h4 className="font-semibold text-slate-800 flex items-center gap-2">
                   <BarChart2 className="w-4.5 h-4.5 text-indigo-600" />
                   {activeModel === ModelType.NEWSBOY ? "需求概率密度与服务水平面积" : "动态库存水平锯齿图 (Sawtooth Diagram)"}
@@ -1654,6 +1849,113 @@ ${JSON.stringify(results, null, 2)}
                     : "展现连续时序（Days）下仓库库存存储量的周期性释放与补货上升过程。"}
                 </p>
               </div>
+
+              {/* SS RATIO WIDGET FOR THRESHOLD MODEL */}
+              {activeModel === ModelType.THRESHOLD && (() => {
+                const D = thresholdParams.D;
+                const C1 = thresholdParams.C1;
+                const C3 = thresholdParams.C3;
+                const L = thresholdParams.L;
+                const sigmaDaily = thresholdParams.sigmaDaily;
+                const Q = Math.sqrt((2 * D * C3) / C1);
+                const sigmaL = sigmaDaily * Math.sqrt(L);
+
+                const getRatioAtSL = (sl: number) => {
+                  const z = inverseNormalCDF(sl);
+                  const ss = z * sigmaL;
+                  const avgInv = Q / 2 + ss;
+                  return Math.max(0, ss / Math.max(1, avgInv));
+                };
+
+                const currentSL = thresholdParams.serviceLevel;
+                const activeRatio = getRatioAtSL(currentSL);
+
+                const svgW = 160;
+                const svgH = 32;
+                const pointsCount = 20;
+                const slMin = 0.80;
+                const slMax = 0.999;
+                const slRange = slMax - slMin;
+
+                let linePoints: string[] = [];
+                for (let i = 0; i <= pointsCount; i++) {
+                  const t = i / pointsCount;
+                  const slVal = slMin + t * slRange;
+                  const ratio = getRatioAtSL(slVal);
+                  const xVal = 4 + t * (svgW - 8);
+                  const yVal = svgH - 4 - (ratio / 0.50) * (svgH - 8); // Scale ratio from 0 to 50%
+                  linePoints.push(`${xVal},${yVal}`);
+                }
+
+                const linePathStr = `M ${linePoints.join(" L ")}`;
+                const areaPathStr = `${linePathStr} L ${4 + (svgW - 8)},${svgH - 4} L ${4},${svgH - 4} Z`;
+
+                const tActive = (currentSL - slMin) / slRange;
+                const xActive = 4 + tActive * (svgW - 8);
+                const yActive = svgH - 4 - (activeRatio / 0.50) * (svgH - 8);
+
+                return (
+                  <div className="flex items-center gap-3 bg-indigo-50/50 hover:bg-indigo-50/80 px-3 py-1.5 rounded-xl border border-indigo-100/40 transition-all select-none" title="安全库存占比演变：点击或拖拽修改服务水平">
+                    <div className="text-left">
+                      <div className="flex items-center gap-1">
+                        <span className="text-[9px] font-black text-indigo-700 uppercase tracking-wider block">安全库存 / 均值库存</span>
+                        <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-pulse inline-block"></span>
+                      </div>
+                      <span className="text-[11px] font-bold text-slate-700 block mt-0.5">
+                        占比: <span className="text-indigo-600 font-extrabold">{(activeRatio * 100).toFixed(1)}%</span>
+                      </span>
+                      <span className="text-[9px] text-slate-400 block">
+                        服务水平: <span className="font-semibold text-indigo-500">{(currentSL * 100).toFixed(1)}%</span>
+                      </span>
+                    </div>
+
+                    <div className="relative">
+                      <svg 
+                        width={svgW} 
+                        height={svgH + 4} 
+                        className="overflow-visible cursor-crosshair"
+                        onClick={(e) => {
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          const clickX = e.clientX - rect.left;
+                          const t = Math.max(0, Math.min(1, (clickX - 4) / (rect.width - 8)));
+                          const clickedSL = slMin + t * slRange;
+                          const finalSL = Math.max(0.80, Math.min(0.999, parseFloat(clickedSL.toFixed(4))));
+                          setThresholdParams(prev => ({ ...prev, serviceLevel: finalSL }));
+                        }}
+                        onMouseMove={(e) => {
+                          if (e.buttons !== 1) return;
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          const moveX = e.clientX - rect.left;
+                          const t = Math.max(0, Math.min(1, (moveX - 4) / (rect.width - 8)));
+                          const clickedSL = slMin + t * slRange;
+                          const finalSL = Math.max(0.80, Math.min(0.999, parseFloat(clickedSL.toFixed(4))));
+                          setThresholdParams(prev => ({ ...prev, serviceLevel: finalSL }));
+                        }}
+                      >
+                        <defs>
+                          <linearGradient id="ss-ratio-spark-grad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="#4f46e5" stopOpacity="0.35" />
+                            <stop offset="100%" stopColor="#4f46e5" stopOpacity="0.02" />
+                          </linearGradient>
+                        </defs>
+                        {/* Base dash line */}
+                        <line x1="4" y1={svgH - 4} x2={svgW - 4} y2={svgH - 4} stroke="#cbd5e1" strokeWidth="1" strokeDasharray="1,2" />
+                        {/* Area */}
+                        <path d={areaPathStr} fill="url(#ss-ratio-spark-grad)" />
+                        {/* Line */}
+                        <path d={linePathStr} fill="none" stroke="#4f46e5" strokeWidth="1.5" strokeLinecap="round" />
+                        {/* Vertical line at active */}
+                        <line x1={xActive} y1="1" x2={xActive} y2={svgH - 4} stroke="#4f46e5" strokeWidth="1" strokeDasharray="2,2" strokeOpacity="0.6" />
+                        {/* Active dot */}
+                        <circle cx={xActive} cy={yActive} r="3.5" fill="#4f46e5" stroke="#ffffff" strokeWidth="1.5" />
+                        {/* Ticks text inside SVG */}
+                        <text x="4" y={svgH + 4} fill="#94a3b8" fontSize="7" fontWeight="bold" fontFamily="monospace" textAnchor="start">80%</text>
+                        <text x={svgW - 4} y={svgH + 4} fill="#94a3b8" fontSize="7" fontWeight="bold" fontFamily="monospace" textAnchor="end">99.9%</text>
+                      </svg>
+                    </div>
+                  </div>
+                );
+              })()}
 
               <div className="flex items-center gap-3">
                 {activeModel !== ModelType.NEWSBOY && (
@@ -1834,6 +2136,34 @@ ${JSON.stringify(results, null, 2)}
                       const ropY = getPixelY(ROP);
                       points.push(`M ${getPixelX(0)} ${ropY} L ${getPixelX(1)} ${ropY}`);
                     }
+                  } else if (activeModel === ModelType.THRESHOLD) {
+                    const cycleCount = sawtoothCycles;
+                    const step = 1 / cycleCount;
+                    const ss = results.safetyStock || 0;
+                    const ROP_val = results.ROP || 0;
+                    const q_val = Q;
+                    
+                    let pStr = `M ${getPixelX(0)} ${getPixelY(q_val + ss)}`;
+                    const randomOffsets = [0.0, -10.0, 15.0, -5.0, 10.0];
+                    for (let c = 0; c < cycleCount; c++) {
+                      const t0 = c * step;
+                      const tOrder = t0 + step * 0.6;
+                      const t1 = (c + 1) * step;
+                      const actualSS = ss + (randomOffsets[c % randomOffsets.length] || 0);
+                      
+                      pStr += ` L ${getPixelX(tOrder)} ${getPixelY(ROP_val)}`;
+                      pStr += ` L ${getPixelX(t1)} ${getPixelY(actualSS)}`;
+                      if (c < cycleCount - 1) {
+                        const nextSS = ss + (randomOffsets[(c + 1) % randomOffsets.length] || 0);
+                        pStr += ` L ${getPixelX(t1)} ${getPixelY(q_val + nextSS)}`;
+                      }
+                    }
+                    points.push(pStr);
+
+                    if (ROP_val > 0) {
+                      const ropY = getPixelY(ROP_val);
+                      points.push(`M ${getPixelX(0)} ${ropY} L ${getPixelX(1)} ${ropY}`);
+                    }
                   }
 
                   const ROPVal = ROP; // scoped reference
@@ -1870,6 +2200,17 @@ ${JSON.stringify(results, null, 2)}
                           inventory = Imax * (tInCycle / f_peak);
                         } else {
                           inventory = Imax * (1 - (tInCycle - f_peak) / (1 - f_peak));
+                        }
+                      } else if (activeModel === ModelType.THRESHOLD) {
+                        const ss = results.safetyStock || 0;
+                        const ROP_val = results.ROP || 0;
+                        const randomOffsets = [0.0, -10.0, 15.0, -5.0, 10.0];
+                        const actualSS = ss + (randomOffsets[safeC % randomOffsets.length] || 0);
+                        const actualPeak = Q + actualSS;
+                        if (tInCycle < 0.6) {
+                          inventory = actualPeak - (tInCycle / 0.6) * (actualPeak - ROP_val);
+                        } else {
+                          inventory = ROP_val - ((tInCycle - 0.6) / 0.4) * (ROP_val - actualSS);
                         }
                       }
                       
@@ -1960,7 +2301,8 @@ ${JSON.stringify(results, null, 2)}
                             {/* L in years = L / 365. Fraction of cycle = (L/365) / t_opt */}
                             {(() => {
                               const cycleTimeYears = results.t_opt || 0.2;
-                              const leadFraction = (eoqParams.L / 365) / cycleTimeYears;
+                              const leadL = activeModel === ModelType.EOQ ? eoqParams.L : activeModel === ModelType.SHORTAGE ? shortageParams.L : activeModel === ModelType.EPQ ? epqParams.L : thresholdParams.L;
+                              const leadFraction = (leadL / 365) / cycleTimeYears;
                               if (leadFraction < 1) {
                                 const xROPTrigger = getPixelX(1/sawtoothCycles - leadFraction / sawtoothCycles);
                                 const xReplenish = getPixelX(1/sawtoothCycles);
@@ -1972,7 +2314,7 @@ ${JSON.stringify(results, null, 2)}
                                     {/* Lead Time Bracket */}
                                     <rect x={xROPTrigger} y={getPixelY(Imax * 0.4)} width={Math.max(2, xReplenish - xROPTrigger)} height="16" fill="#10b981" fillOpacity="0.08" rx="2" stroke="#10b981" strokeWidth="0.5" strokeDasharray="2,2" className="transition-all duration-300 ease-in-out" />
                                     <text x={xROPTrigger + (xReplenish - xROPTrigger)/2} y={getPixelY(Imax * 0.4) + 11} fill="#047857" fontSize="8" fontWeight="bold" textAnchor="middle" className="transition-all duration-300 ease-in-out">
-                                      前置期 L: {activeModel === ModelType.EOQ ? eoqParams.L : activeModel === ModelType.SHORTAGE ? shortageParams.L : epqParams.L}天
+                                      前置期 L: {leadL}天
                                     </text>
                                   </>
                                 );
@@ -2261,6 +2603,7 @@ ${JSON.stringify(results, null, 2)}
             shortageParams={shortageParams}
             epqParams={epqParams}
             newsboyParams={newsboyParams}
+            thresholdParams={thresholdParams}
             results={results}
           />
 
@@ -2328,6 +2671,51 @@ ${JSON.stringify(results, null, 2)}
                         一年内需要发起的总采购次数
                       </span>
                     </div>
+
+                    {activeModel === ModelType.THRESHOLD && (
+                      <>
+                        <div className="bg-indigo-50/50 p-3 rounded-xl border border-indigo-200/40 col-span-2 grid grid-cols-2 gap-3">
+                          <div>
+                            <span className="text-[10px] font-bold text-indigo-700 uppercase block">安全库存 (Safety Stock)</span>
+                            <span className="text-lg font-extrabold text-indigo-600 mt-1 block">
+                              {results.safetyStock ? results.safetyStock.toFixed(1) : "0"} 件
+                            </span>
+                            <span className="text-[9px] text-slate-500 mt-0.5 block">
+                              z-score ({results.zScore?.toFixed(2)}) * σ_L 缓存波动
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] font-bold text-emerald-700 uppercase block">重新订货点 (s* / ROP)</span>
+                            <span className="text-lg font-extrabold text-emerald-600 mt-1 block">
+                              {results.ROP ? results.ROP.toFixed(1) : "0"} 件
+                            </span>
+                            <span className="text-[9px] text-slate-500 mt-0.5 block">
+                              当库存低至此水位时触发 Q* 订货
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/40">
+                          <span className="text-[10px] font-medium text-slate-500 uppercase block">提前期均值需求 (μ_L)</span>
+                          <span className="text-lg font-bold text-slate-800 mt-1 block">
+                            {results.leadTimeDemandMean ? results.leadTimeDemandMean.toFixed(1) : "0"} 件
+                          </span>
+                          <span className="text-[9px] text-slate-400 mt-0.5 block">
+                            (D/365) * L 天的预期总消耗
+                          </span>
+                        </div>
+
+                        <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/40">
+                          <span className="text-[10px] font-medium text-slate-500 uppercase block">提前期标准差 (σ_L)</span>
+                          <span className="text-lg font-bold text-slate-800 mt-1 block">
+                            {results.leadTimeDemandStdDev ? results.leadTimeDemandStdDev.toFixed(1) : "0"} 件
+                          </span>
+                          <span className="text-[9px] text-slate-400 mt-0.5 block">
+                            σ_d * 根号L. 提前期累计需求波动量
+                          </span>
+                        </div>
+                      </>
+                    )}
                   </>
                 ) : (
                   <>
@@ -2397,6 +2785,7 @@ ${JSON.stringify(results, null, 2)}
                       <option value="D">年需求量 (D)</option>
                       {activeModel === ModelType.SHORTAGE && <option value="C4">缺货费 (C4)</option>}
                       {activeModel === ModelType.EPQ && <option value="P">生产率 (P)</option>}
+                      {activeModel === ModelType.THRESHOLD && <option value="serviceLevel">服务水平 (serviceLevel)</option>}
                     </>
                   ) : (
                     <>
@@ -2420,6 +2809,124 @@ ${JSON.stringify(results, null, 2)}
                     const h = 130;
                     const padX = 35;
                     const padY = 20;
+
+                    if (sensitiveParam === "serviceLevel" && activeModel === ModelType.THRESHOLD) {
+                      const costs = sensitivityData.map(d => d.totalCost);
+                      const minC = Math.min(...costs);
+                      const maxC = Math.max(...costs);
+                      const rangeC = maxC - minC || 1;
+
+                      const hCosts = sensitivityData.map(d => d.holdingCost || 0);
+                      const minHC = Math.min(...hCosts);
+                      const maxHC = Math.max(...hCosts);
+                      const rangeHC = maxHC - minHC || 1;
+
+                      const risks = sensitivityData.map(d => d.shortageRisk || 0);
+                      const minRisk = Math.min(...risks);
+                      const maxRisk = Math.max(...risks);
+                      const rangeRisk = maxRisk - minRisk || 1;
+
+                      const getX = (index: number) => {
+                        return padX + (index / (sensitivityData.length - 1)) * (w - 2 * padX);
+                      };
+
+                      const getYCost = (cost: number) => {
+                        const ratio = (cost - minC) / rangeC;
+                        return h - padY - ratio * (h - 2 * padY);
+                      };
+
+                      const getYHolding = (hc: number) => {
+                        const ratio = (hc - minHC) / rangeHC;
+                        return h - padY - ratio * (h - 2 * padY);
+                      };
+
+                      const getYRisk = (risk: number) => {
+                        const ratio = (risk - minRisk) / rangeRisk;
+                        return h - padY - ratio * (h - 2 * padY);
+                      };
+
+                      const pathCost = sensitivityData.map((d, idx) => {
+                        return `${idx === 0 ? "M" : "L"} ${getX(idx)} ${getYCost(d.totalCost)}`;
+                      }).join(" ");
+
+                      const pathHolding = sensitivityData.map((d, idx) => {
+                        return `${idx === 0 ? "M" : "L"} ${getX(idx)} ${getYHolding(d.holdingCost || 0)}`;
+                      }).join(" ");
+
+                      const pathRisk = sensitivityData.map((d, idx) => {
+                        return `${idx === 0 ? "M" : "L"} ${getX(idx)} ${getYRisk(d.shortageRisk || 0)}`;
+                      }).join(" ");
+
+                      return (
+                        <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-full overflow-visible">
+                          {/* Grid references */}
+                          <line x1={padX} y1={h - padY} x2={w - padX} y2={h - padY} stroke="#cbd5e1" strokeWidth="0.8" />
+                          
+                          {/* Guidelines */}
+                          <line x1={padX} y1={padY} x2={padX} y2={h - padY} stroke="#cbd5e1" strokeWidth="0.8" />
+                          <line x1={w - padX} y1={padY} x2={w - padX} y2={h - padY} stroke="#cbd5e1" strokeWidth="0.8" />
+
+                          {/* Curves */}
+                          {/* 1. Total Cost - Violet */}
+                          <path d={pathCost} fill="none" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+                          
+                          {/* 2. Holding Cost - Teal */}
+                          <path d={pathHolding} fill="none" stroke="#0d9488" strokeWidth="1.5" strokeDasharray="3,2" strokeLinecap="round" strokeLinejoin="round" />
+                          
+                          {/* 3. Shortage Risk - Rose */}
+                          <path d={pathRisk} fill="none" stroke="#f43f5e" strokeWidth="1.5" strokeDasharray="2,2" strokeLinecap="round" strokeLinejoin="round" />
+
+                          {/* Interactive Group Toggles */}
+                          {sensitivityData.map((d, idx) => {
+                            const isCurrent = Math.abs(d.value - thresholdParams.serviceLevel) < 0.005;
+                            return (
+                              <g key={idx} className="group cursor-pointer">
+                                {/* Vertical highlight line when active/hover */}
+                                <line x1={getX(idx)} y1={padY} x2={getX(idx)} y2={h - padY} stroke="#4f46e5" strokeWidth="1" strokeOpacity="0" className="group-hover:stroke-opacity-40 transition-all duration-200" />
+                                
+                                {/* Total Cost Dot */}
+                                <circle cx={getX(idx)} cy={getYCost(d.totalCost)} r={isCurrent ? "3.5" : "2"} fill="#6366f1" stroke="#ffffff" strokeWidth="0.5" />
+                                
+                                {/* Holding Cost Dot */}
+                                <circle cx={getX(idx)} cy={getYHolding(d.holdingCost || 0)} r={isCurrent ? "3" : "1.5"} fill="#0d9488" stroke="#ffffff" strokeWidth="0.5" />
+                                
+                                {/* Shortage Risk Dot */}
+                                <circle cx={getX(idx)} cy={getYRisk(d.shortageRisk || 0)} r={isCurrent ? "3" : "1.5"} fill="#f43f5e" stroke="#ffffff" strokeWidth="0.5" />
+
+                                <title>{`服务水平: ${(d.value * 100).toFixed(1)}%\n总期望成本: ¥${d.totalCost}\n持有成本: ¥${d.holdingCost}\n缺货风险: ${d.shortageRisk.toFixed(2)}%`}</title>
+                              </g>
+                            );
+                          })}
+
+                          {/* Axes text */}
+                          <text x={padX} y={h - 5} fill="#64748b" fontSize="8" textAnchor="middle">80%</text>
+                          <text x={w/2} y={h - 5} fill="#6366f1" fontSize="8" textAnchor="middle" fontWeight="bold">当前SL: {(thresholdParams.serviceLevel * 100).toFixed(1)}%</text>
+                          <text x={w - padX} y={h - 5} fill="#64748b" fontSize="8" textAnchor="middle">99.9%</text>
+
+                          {/* Left label (Costs) */}
+                          <text x={padX - 5} y={padY + 5} fill="#64748b" fontSize="7" textAnchor="end" transform={`rotate(-90 ${padX - 5} ${padY + 5})`}>
+                            成本 (¥)
+                          </text>
+
+                          {/* Right label (Shortage Risk) */}
+                          <text x={w - padX + 5} y={padY + 5} fill="#f43f5e" fontSize="7" textAnchor="start" transform={`rotate(90 ${w - padX + 5} ${padY + 5})`}>
+                            缺货风险 (%)
+                          </text>
+
+                          {/* Legend inline */}
+                          <g transform="translate(60, 10)">
+                            <circle cx="0" cy="-2.5" r="2.5" fill="#6366f1" />
+                            <text x="6" y="0.5" fill="#475569" fontSize="7">总成本</text>
+
+                            <circle cx="50" cy="-2.5" r="2.5" fill="#0d9488" />
+                            <text x="56" y="0.5" fill="#475569" fontSize="7">持有成本</text>
+
+                            <circle cx="105" cy="-2.5" r="2.5" fill="#f43f5e" />
+                            <text x="111" y="0.5" fill="#475569" fontSize="7">缺货风险</text>
+                          </g>
+                        </svg>
+                      );
+                    }
 
                     const costs = sensitivityData.map(d => d.totalCost);
                     const minC = Math.min(...costs);
@@ -2977,25 +3484,25 @@ ${JSON.stringify(results, null, 2)}
                       <div className="border-b border-slate-100 pb-2">
                         <span className="text-[10px] text-slate-400 block">年总需求率 (D)</span>
                         <span className="font-bold text-slate-700">
-                          {activeModel === ModelType.EOQ ? eoqParams.D : activeModel === ModelType.SHORTAGE ? shortageParams.D : epqParams.D} 件/年
+                          {activeModel === ModelType.EOQ ? eoqParams.D : activeModel === ModelType.SHORTAGE ? shortageParams.D : activeModel === ModelType.EPQ ? epqParams.D : thresholdParams.D} 件/年
                         </span>
                       </div>
                       <div className="border-b border-slate-100 pb-2">
                         <span className="text-[10px] text-slate-400 block">单位年持有费 (C1)</span>
                         <span className="font-bold text-slate-700">
-                          ¥{activeModel === ModelType.EOQ ? eoqParams.C1 : activeModel === ModelType.SHORTAGE ? shortageParams.C1 : epqParams.C1} /年
+                          ¥{activeModel === ModelType.EOQ ? eoqParams.C1 : activeModel === ModelType.SHORTAGE ? shortageParams.C1 : activeModel === ModelType.EPQ ? epqParams.C1 : thresholdParams.C1} /年
                         </span>
                       </div>
                       <div className="border-b border-slate-100 pb-2">
                         <span className="text-[10px] text-slate-400 block">起订准备费 (C3)</span>
                         <span className="font-bold text-slate-700">
-                          ¥{activeModel === ModelType.EOQ ? eoqParams.C3 : activeModel === ModelType.SHORTAGE ? shortageParams.C3 : epqParams.C3} /次
+                          ¥{activeModel === ModelType.EOQ ? eoqParams.C3 : activeModel === ModelType.SHORTAGE ? shortageParams.C3 : activeModel === ModelType.EPQ ? epqParams.C3 : thresholdParams.C3} /次
                         </span>
                       </div>
                       <div className="border-b border-slate-100 pb-2">
                         <span className="text-[10px] text-slate-400 block">前置交货时间 (L)</span>
                         <span className="font-bold text-slate-700">
-                          {activeModel === ModelType.EOQ ? eoqParams.L : activeModel === ModelType.SHORTAGE ? shortageParams.L : epqParams.L} 天
+                          {activeModel === ModelType.EOQ ? eoqParams.L : activeModel === ModelType.SHORTAGE ? shortageParams.L : activeModel === ModelType.EPQ ? epqParams.L : thresholdParams.L} 天
                         </span>
                       </div>
                     </>
@@ -3849,6 +4356,158 @@ ${JSON.stringify(results, null, 2)}
                 className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-md shadow-indigo-100 hover:shadow-lg transition-all cursor-pointer"
               >
                 已了解，返回控制台
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 5: THRESHOLD (s, Q) POLICY EXPLAINER MODAL (CONTINUOUS VS PERIODIC) */}
+      {showThresholdInfoModal && (
+        <div className="fixed inset-0 bg-slate-900/65 backdrop-blur-xs z-50 flex items-center justify-center p-4 overflow-y-auto animate-fade-in">
+          <div className="bg-white rounded-3xl shadow-2xl border border-slate-200/80 max-w-3xl w-full max-h-[90vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+            
+            {/* Modal Header */}
+            <div className="p-6 border-b border-slate-100 bg-linear-to-r from-indigo-50/50 to-indigo-100/20 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-indigo-600 text-white rounded-xl shadow-sm">
+                  <Info className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-extrabold text-slate-950 flex items-center gap-1.5">
+                    (s, Q) 连续型随机阀值控制决策逻辑
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    解析连续评述（Continuous Review）与定期评述（Periodic Review）系统的差异与运筹学对比
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowThresholdInfoModal(false)}
+                className="text-slate-400 hover:text-slate-600 text-xl font-bold cursor-pointer bg-slate-100 hover:bg-slate-200/80 w-8 h-8 rounded-full flex items-center justify-center transition-all"
+              >
+                &times;
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-6">
+              
+              {/* Introduction Box */}
+              <div className="bg-indigo-50/40 border border-indigo-100/60 rounded-2xl p-5 leading-relaxed">
+                <h4 className="font-bold text-indigo-950 text-sm mb-1.5 flex items-center gap-1.5">
+                  <span className="w-1.5 h-3 bg-indigo-600 rounded-full inline-block"></span>
+                  什么是连续评述系统（Continuous Review System）中的 (s, Q) 策略？
+                </h4>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  在运筹学存储论中，<strong>(s, Q) 策略</strong> 是一种典型的<strong>连续评述（Continuous Review）</strong>模型。
+                  当实际库存加上在途订货量（即库存头寸 Inventory Position）由于消耗或销售降到临界值 <strong>再订货点 $s$（Reorder Point, ROP）</strong> 或以下时，
+                  系统立即发出采购或生产指令，每次的订货量均为固定批量 <strong>$Q$（Order Quantity）</strong>。
+                  这种方式能够确保库存刚突破危险线就被拉回，从而最大化削减安全库存。
+                </p>
+              </div>
+
+              {/* Core Comparison: Continuous vs Periodic */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                
+                {/* Continuous Review Panel */}
+                <div className="border border-slate-150 rounded-2xl p-4 bg-slate-50/50 hover:border-indigo-200 transition-all">
+                  <div className="flex items-center gap-2 mb-3">
+                    <span className="p-1 bg-emerald-50 text-emerald-700 rounded-lg">
+                      <Activity className="w-4 h-4" />
+                    </span>
+                    <h5 className="font-bold text-slate-800 text-xs sm:text-sm">连续评述系统 (Continuous Review)</h5>
+                  </div>
+                  <ul className="text-xs text-slate-600 space-y-2 leading-relaxed list-disc list-inside">
+                    <li><strong className="text-slate-900">全天候实时监控：</strong>库存发生任何单笔进出变动，系统均通过信息化工具即时同步并触发校验。</li>
+                    <li><strong className="text-slate-900">对冲时序较短：</strong>安全库存仅需覆盖<strong>前置期 L</strong> 天数内的需求随机波动风险。</li>
+                    <li><strong className="text-slate-900">经济效益：</strong>在 ROP ($s$) 处立刻订货固定批量 $Q$。$Q$ 可直接由 EOQ 理论一阶导数取得，确保单次订货费和持有成本的最佳对冲。</li>
+                  </ul>
+                </div>
+
+                {/* Periodic Review Panel */}
+                <div className="border border-slate-150 rounded-2xl p-4 bg-slate-50/50 hover:border-amber-200 transition-all">
+                  <div className="flex items-center gap-2 mb-3">
+                    <span className="p-1 bg-amber-50 text-amber-700 rounded-lg">
+                      <Clock className="w-4 h-4" />
+                    </span>
+                    <h5 className="font-bold text-slate-800 text-xs sm:text-sm">定期评述系统 (Periodic Review)</h5>
+                  </div>
+                  <ul className="text-xs text-slate-600 space-y-2 leading-relaxed list-disc list-inside">
+                    <li><strong className="text-slate-900">固定时间间隔：</strong>每隔特定的周期 $R$（如每周一、每月初）才对库存进行盘点或查询，不作实时拦截。</li>
+                    <li><strong className="text-slate-900">对冲时序较长：</strong>安全库存必须覆盖整个<strong>“盘点周期 R + 前置期 L”</strong>的总时间段内的不确定性。</li>
+                    <li><strong className="text-slate-900">弹性订货：</strong>每次补货量是变动的，即补足到目标最大库存水平 $S$。每次采购规模零散，可能失去集中议价优势。</li>
+                  </ul>
+                </div>
+
+              </div>
+
+              {/* Analytical Compare Table */}
+              <div className="border border-slate-100 rounded-2xl overflow-hidden shadow-2xs">
+                <table className="w-full text-xs text-left text-slate-600">
+                  <thead className="bg-slate-50 text-slate-800 font-bold border-b border-slate-100">
+                    <tr>
+                      <th className="p-3">决策/运筹要素</th>
+                      <th className="p-3 text-indigo-700">连续评述系统 (s, Q)</th>
+                      <th className="p-3 text-amber-700">定期评述系统 (R, S)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    <tr>
+                      <td className="p-3 font-semibold text-slate-900">库存监控方式</td>
+                      <td className="p-3">逐日逐时实时监控，每笔出库即时刷新状态</td>
+                      <td className="p-3">定时（按天、周、月等固定频次）拉取与盘点</td>
+                    </tr>
+                    <tr>
+                      <td className="p-3 font-semibold text-slate-900">补货触发机制</td>
+                      <td className="p-3">库存头寸跌破订货点 $s$ 时<strong>立即可视化自动报警补齐</strong></td>
+                      <td className="p-3">与库存高低无关，仅由盘点时点自动唤醒</td>
+                    </tr>
+                    <tr>
+                      <td className="p-3 font-semibold text-slate-900">订货批量 (Quantity)</td>
+                      <td className="p-3">每次订货量固定为最优批量 $Q$（追求总成本极小）</td>
+                      <td className="p-3">不固定，订货量为 $S - $ 当前库存（弹性波动大）</td>
+                    </tr>
+                    <tr className="bg-indigo-50/10">
+                      <td className="p-3 font-semibold text-slate-900 flex items-center gap-1">
+                        安全库存需求
+                        <span className="text-[10px] bg-red-100 text-red-700 px-1 py-0.2 rounded-xs scale-90">核心对比</span>
+                      </td>
+                      <td className="p-3 font-semibold text-indigo-600">
+                        较低。仅防范前置期 $L$ 期间内的需求波动：<br/>
+                        <span className="font-mono text-[10px]">SS = z × σ_L</span>
+                      </td>
+                      <td className="p-3 font-semibold text-slate-700">
+                        较高。因存在信息时滞，须防范 $L + R$ 期间的累积波动：<br/>
+                        <span className="font-mono text-[10px]">SS = z × σ_(L+R)</span>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td className="p-3 font-semibold text-slate-900">适用货物特性</td>
+                      <td className="p-3">价值极高、单次订货费大、需求变化剧烈的核心物资</td>
+                      <td className="p-3">价值一般、需求稳定、可多货拼单联合采购的普通物资</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Informational advice */}
+              <p className="text-[10px] text-slate-400 bg-slate-50 p-3 rounded-xl border border-slate-150 leading-relaxed text-center">
+                💡 <strong>运筹管理见解：</strong> 连续评述系统通过信息化的高频对冲机制（如实时看板和阈值检测），将对冲波动的保护期压缩至前置期。这就是为什么引入自动化的 (s, Q) 连续策略能有效释放库容并提升整体供应链的服务水平。
+              </p>
+
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-5 border-t border-slate-100 bg-slate-50 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowThresholdInfoModal(false)}
+                className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-md shadow-indigo-100 hover:shadow-lg transition-all cursor-pointer"
+              >
+                关闭并返回控制台
               </button>
             </div>
 
