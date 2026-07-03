@@ -282,6 +282,63 @@ else:
 
 print("=========================================")
 `;
+    } else if (modelType === "THRESHOLD") {
+      pyScript = `import math
+
+# 1. \u8FDE\u7EED\u578B\u968F\u673A\u5E93\u5B58\u63A7\u5236 (s, Q) \u9600\u503C\u63A7\u5236\u6A21\u578B
+D = ${params.D}               # \u5E74\u9700\u6C42\u91CF
+C1 = ${params.C1}             # \u5355\u4F4D\u5E74\u6301\u6709\u8D39
+C3 = ${params.C3}             # \u5355\u6B21\u8D77\u8BA2/\u6574\u5907\u6210\u672C
+L = ${params.L}               # \u524D\u7F6E\u65F6\u95F4 (\u5929)
+sigma_daily = ${params.sigmaDaily} # \u65E5\u9700\u6C42\u6807\u51C6\u5DEE
+service_level = ${params.serviceLevel} # \u671F\u671B\u670D\u52A1\u6C34\u5E73 (0.80 ~ 0.999)
+
+# 2. \u8FD0\u7B97\u516C\u5F0F
+Q_opt = math.sqrt((2 * D * C3) / C1)
+daily_demand = D / 365.0
+lead_mean = daily_demand * L
+lead_std = sigma_daily * math.sqrt(L)
+
+# \u91C7\u7528\u9AD8\u7CBE\u5EA6 Probit \u7684\u6B63\u6001\u5206\u5E03\u5B89\u5168\u7CFB\u6570\u7B97\u6CD5
+def erfinv(y):
+    a = 0.147
+    if y == 0: return 0
+    log_term = math.log(1 - y*y)
+    tmp1 = 2 / (math.pi * a) + log_term / 2
+    tmp2 = log_term / a
+    val = math.sqrt(math.sqrt(tmp1*tmp1 - tmp2) - tmp1)
+    return val if y > 0 else -val
+
+def ppf(p):
+    return math.sqrt(2) * erfinv(2 * p - 1)
+
+z = ppf(service_level)
+ss = z * lead_std
+rop = lead_mean + ss
+
+setup_cost = (D / Q_opt) * C3
+holding_cost = (Q_opt / 2.0 + ss) * C1
+total_cost = setup_cost + holding_cost
+
+# 3. \u8F93\u51FA\u6C42\u89E3\u7ED3\u679C
+print("=========================================")
+print("=== PYTHON \u8FD0\u7B79\u5B66\uFF1A\u8FDE\u7EED\u578B (s, Q) \u9600\u503C\u63A7\u5236 ===")
+print("=========================================")
+print(f"|  \u5E74\u9700\u6C42\u603B\u91CF (D):         {D:12.0f} \u4EF6")
+print(f"|  \u671F\u671B\u670D\u52A1\u6C34\u5E73 (SL):      {service_level*100:11.1f}%")
+print(f"|  \u5B89\u5168\u7CFB\u6570 Z-score:       {z:12.4f}")
+print("-----------------------------------------")
+print(f"|  \u6700\u4F18\u8BA2\u8D27\u6279\u91CF (Q*):      {Q_opt:12.2f} \u4EF6")
+print(f"|  \u63D0\u524D\u671F\u5747\u503C\u9700\u6C42 (\u03BC_L):   {lead_mean:12.2f} \u4EF6")
+print(f"|  \u63D0\u524D\u671F\u6807\u51C6\u5DEE (\u03C3_L):     {lead_std:12.2f} \u4EF6")
+print(f"|  \u5B89\u5168\u5E93\u5B58 (Safety Stock): {ss:12.2f} \u4EF6")
+print(f"|  \u91CD\u65B0\u8BA2\u8D27\u89E6\u53D1\u9608\u503C (s*):  {rop:12.2f} \u4EF6")
+print("-----------------------------------------")
+print(f"|  \u5E74\u8D77\u8BA2\u6574\u5907\u8D39 (Setup):   \xA5{setup_cost:11.2f}")
+print(f"|  \u5E74\u5747\u6301\u6709\u6210\u672C (Holding): \xA5{holding_cost:11.2f}")
+print(f"|  \u5E74\u5316\u671F\u671B\u603B\u6210\u672C (Total): \xA5{total_cost:11.2f}")
+print("=========================================")
+`;
     }
     const tempFile = import_path.default.join(process.cwd(), `temp_solver_${Math.random().toString(36).substring(3)}.py`);
     import_fs.default.writeFile(tempFile, pyScript, (err) => {
@@ -364,7 +421,7 @@ function simulatePythonConsole(modelType, params) {
 |  \u6700\u4F18\u5E74\u5316\u603B\u671F\u671B\u6210\u672C (Total):\xA5${(setup + hold).toFixed(2).padStart(11)}
 |  \u91CD\u65B0\u5F00\u5DE5\u89E6\u53D1\u70B9 (ROP):   ${(params.D / 365 * params.L).toFixed(2).padStart(12)} \u4EF6
 =========================================`;
-  } else {
+  } else if (modelType === "NEWSBOY") {
     const cr = params.Cu / (params.Cu + params.Co);
     const a = params.minDemand;
     const b = params.maxDemand;
@@ -431,6 +488,47 @@ function simulatePythonConsole(modelType, params) {
 |  \u671F\u671B\u6700\u5C0F\u7EFC\u5408\u635F\u5931 (Loss): \xA5${total.toFixed(2).padStart(11)}
 =========================================`;
     }
+  } else if (modelType === "THRESHOLD") {
+    const Q = Math.sqrt(2 * params.D * params.C3 / params.C1);
+    const dailyDemand = params.D / 365;
+    const leadMean = dailyDemand * params.L;
+    const leadStd = params.sigmaDaily * Math.sqrt(params.L);
+    const erfinv = (y) => {
+      const a_val = 0.147;
+      if (y === 0) return 0;
+      const log_term = Math.log(1 - y * y);
+      const tmp1 = 2 / (Math.PI * a_val) + log_term / 2;
+      const tmp2 = log_term / a_val;
+      const val = Math.sqrt(Math.sqrt(tmp1 * tmp1 - tmp2) - tmp1);
+      return y > 0 ? val : -val;
+    };
+    const ppf = (p) => {
+      return Math.sqrt(2) * erfinv(2 * p - 1);
+    };
+    const z = ppf(params.serviceLevel);
+    const ss = z * leadStd;
+    const ROP = leadMean + ss;
+    const setup = params.D / Q * params.C3;
+    const hold = (Q / 2 + ss) * params.C1;
+    return `=========================================
+=== PYTHON \u8FD0\u7B79\u5B66\uFF1A\u8FDE\u7EED\u578B (s, Q) \u9600\u503C\u63A7\u5236 ===
+=========================================
+|  \u5E74\u9700\u6C42\u603B\u91CF (D):         ${params.D.toFixed(0).padStart(12)} \u4EF6
+|  \u671F\u671B\u670D\u52A1\u6C34\u5E73 (SL):      ${(params.serviceLevel * 100).toFixed(1).padStart(11)}%
+|  \u5B89\u5168\u7CFB\u6570 Z-score:       ${z.toFixed(4).padStart(12)}
+-----------------------------------------
+|  \u6700\u4F18\u8BA2\u8D27\u6279\u91CF (Q*):      ${Q.toFixed(2).padStart(12)} \u4EF6
+|  \u63D0\u524D\u671F\u5747\u503C\u9700\u6C42 (\u03BC_L):   ${leadMean.toFixed(2).padStart(12)} \u4EF6
+|  \u63D0\u524D\u671F\u6807\u51C6\u5DEE (\u03C3_L):     ${leadStd.toFixed(2).padStart(12)} \u4EF6
+|  \u5B89\u5168\u5E93\u5B58 (Safety Stock): ${ss.toFixed(2).padStart(12)} \u4EF6
+|  \u91CD\u65B0\u8BA2\u8D27\u89E6\u53D1\u9608\u503C (s*):  ${ROP.toFixed(2).padStart(12)} \u4EF6
+-----------------------------------------
+|  \u5E74\u8D77\u8BA2\u6574\u5907\u8D39 (Setup):   \xA5${setup.toFixed(2).padStart(11)}
+|  \u5E74\u5747\u6301\u6709\u6210\u672C (Holding): \xA5${hold.toFixed(2).padStart(11)}
+|  \u5E74\u5316\u671F\u671B\u603B\u6210\u672C (Total): \xA5${(setup + hold).toFixed(2).padStart(11)}
+=========================================`;
+  } else {
+    return "\u672A\u77E5\u6A21\u578B";
   }
 }
 async function startServer() {
